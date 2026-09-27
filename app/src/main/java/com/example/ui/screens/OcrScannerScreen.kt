@@ -2,8 +2,6 @@ package com.example.ui.screens
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.media.AudioManager
-import android.media.ToneGenerator
 import android.util.Log
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -75,12 +73,14 @@ import androidx.core.content.ContextCompat
 import com.example.ui.theme.CyanAccent
 import com.example.ui.theme.PaymentPartial
 import com.example.ui.viewmodel.RepairViewModel
+import com.example.util.ScannerAudioHelper
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.launch
 import java.util.Locale
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 @Composable
 fun OcrScannerScreen(
@@ -115,6 +115,9 @@ fun OcrScannerScreen(
     var detectedJobNumber by remember { mutableStateOf("") }
     var notFoundDialogVisible by remember { mutableStateOf(false) }
     var isScanningActive by remember { mutableStateOf(true) }
+    val isCheckingDatabase = remember { AtomicBoolean(false) }
+
+    val audioHelper = remember { ScannerAudioHelper(context) }
 
     val textRecognizer = remember {
         TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
@@ -125,6 +128,7 @@ fun OcrScannerScreen(
         onDispose {
             cameraExecutor.shutdown()
             textRecognizer.close()
+            audioHelper.release()
         }
     }
 
@@ -148,6 +152,7 @@ fun OcrScannerScreen(
             coroutineScope.launch {
                 val repair = viewModel.findRepairByJobNumber(normalized)
                 if (repair != null) {
+                    audioHelper.playConfirmationBeep()
                     onRepairFound(repair.id)
                 } else {
                     notFoundDialogVisible = true
@@ -180,7 +185,7 @@ fun OcrScannerScreen(
                             .also { analysis ->
                                 analysis.setAnalyzer(cameraExecutor) { imageProxy ->
                                     val mediaImage = imageProxy.image
-                                    if (mediaImage != null && isScanningActive) {
+                                    if (mediaImage != null && isScanningActive && !isCheckingDatabase.get()) {
                                         val image = InputImage.fromMediaImage(
                                             mediaImage,
                                             imageProxy.imageInfo.rotationDegrees
@@ -188,13 +193,30 @@ fun OcrScannerScreen(
                                         textRecognizer.process(image)
                                             .addOnSuccessListener { visionText ->
                                                 val found = extractAndNormalizeJobNumber(visionText.text)
-                                                if (found != null && isScanningActive) {
-                                                    isScanningActive = false // Stop and lock scanning immediately
-                                                    detectedJobNumber = found
-                                                    try {
-                                                        val toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
-                                                        toneGen.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
-                                                    } catch (_: Exception) {}
+                                                if (found != null && isScanningActive && isCheckingDatabase.compareAndSet(false, true)) {
+                                                    coroutineScope.launch {
+                                                        try {
+                                                            val repair = viewModel.findRepairByJobNumber(found)
+                                                            if (repair != null) {
+                                                                // Valid confirmed existing job:
+                                                                // 1. Immediately lock scanning so no subsequent frames or duplicate beeps run
+                                                                isScanningActive = false
+                                                                detectedJobNumber = found
+                                                                // 2. Play ONE short confirmation beep/tick
+                                                                audioHelper.playConfirmationBeep()
+                                                                // 3. Open matching Job Details
+                                                                onRepairFound(repair.id)
+                                                            } else {
+                                                                // Non-existing / invalid Job:
+                                                                // Do NOT play beep!
+                                                                isScanningActive = false
+                                                                detectedJobNumber = found
+                                                                notFoundDialogVisible = true
+                                                            }
+                                                        } finally {
+                                                            isCheckingDatabase.set(false)
+                                                        }
+                                                    }
                                                 }
                                             }
                                             .addOnCompleteListener {
@@ -293,6 +315,7 @@ fun OcrScannerScreen(
                 IconButton(onClick = {
                     detectedJobNumber = ""
                     isScanningActive = true
+                    isCheckingDatabase.set(false)
                 }) {
                     Icon(Icons.Default.Refresh, contentDescription = "Scan Again", tint = Color.White)
                 }
@@ -397,6 +420,7 @@ fun OcrScannerScreen(
                     TextButton(onClick = {
                         detectedJobNumber = ""
                         isScanningActive = true
+                        isCheckingDatabase.set(false)
                     }) {
                         Icon(Icons.Default.Refresh, contentDescription = null, tint = CyanAccent, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(4.dp))
@@ -417,7 +441,10 @@ fun OcrScannerScreen(
     if (notFoundDialogVisible) {
         val normalized = viewModel.repository.normalizeJobNumber(detectedJobNumber)
         AlertDialog(
-            onDismissRequest = { notFoundDialogVisible = false },
+            onDismissRequest = {
+                notFoundDialogVisible = false
+                isCheckingDatabase.set(false)
+            },
             title = { Text("Job Number Not Found") },
             text = {
                 Text("No repair job found with Job Number #$normalized. Please check the sticker number or enter it manually.")
@@ -427,6 +454,7 @@ fun OcrScannerScreen(
                     onClick = {
                         notFoundDialogVisible = false
                         isScanningActive = true
+                        isCheckingDatabase.set(false)
                     },
                     colors = ButtonDefaults.buttonColors(containerColor = CyanAccent)
                 ) {
@@ -434,7 +462,10 @@ fun OcrScannerScreen(
                 }
             },
             dismissButton = {
-                TextButton(onClick = { notFoundDialogVisible = false }) {
+                TextButton(onClick = {
+                    notFoundDialogVisible = false
+                    isCheckingDatabase.set(false)
+                }) {
                     Text("Enter Manually")
                 }
             }

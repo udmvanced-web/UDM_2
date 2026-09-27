@@ -1,7 +1,12 @@
 package com.example.ui.screens
 
 import android.content.Context
+import android.content.pm.PackageManager
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
+import com.example.data.repository.SmsSendResult
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -61,6 +66,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -114,6 +120,39 @@ fun RepairDetailsScreen(
     val (items, payments) = safeGetItemsAndPayments(repairId, viewModel)
     val historyFlow = remember(repairId) { viewModel.getHistoryForRepair(repairId) }
     val history by historyFlow.collectAsState(initial = emptyList())
+
+    // Observe SMS events for this repair job
+    LaunchedEffect(repairId) {
+        viewModel.smsEvents.collect { event ->
+            if (event.repairId == repairId) {
+                snackbarHostState.showSnackbar(event.message)
+            }
+        }
+    }
+
+    val smsPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission()
+    ) { isGranted ->
+        if (isGranted) {
+            repair?.let { currentRepair ->
+                viewModel.sendReadySmsExplicit(currentRepair) { result ->
+                    coroutineScope.launch {
+                        val msg = when (result) {
+                            is SmsSendResult.SentOrQueued -> "Ready SMS initiated and queued for ${currentRepair.customerPhone}"
+                            is SmsSendResult.PermissionDenied -> "SMS permission not granted."
+                            is SmsSendResult.Failed -> "Failed to send SMS: ${result.error}"
+                            is SmsSendResult.DisabledInSettings -> "Automatic SMS is disabled in Settings."
+                        }
+                        snackbarHostState.showSnackbar(msg)
+                    }
+                }
+            }
+        } else {
+            coroutineScope.launch {
+                snackbarHostState.showSnackbar("SMS permission not granted. Please allow SMS permission in Android settings.")
+            }
+        }
+    }
 
     // Dialog States
     var showAddPaymentDialog by remember { mutableStateOf(false) }
@@ -197,12 +236,25 @@ fun RepairDetailsScreen(
                             leadingIcon = { Icon(Icons.Default.Message, contentDescription = null) },
                             onClick = {
                                 showMenu = false
-                                viewModel.sendReadySmsExplicit(repair) { sent ->
-                                    coroutineScope.launch {
-                                        snackbarHostState.showSnackbar(
-                                            if (sent) "SMS sent to ${repair.customerPhone}" else "Failed to send SMS (check SIM/Permission)"
-                                        )
+                                val hasPermission = ContextCompat.checkSelfPermission(
+                                    context,
+                                    android.Manifest.permission.SEND_SMS
+                                ) == PackageManager.PERMISSION_GRANTED
+
+                                if (hasPermission) {
+                                    viewModel.sendReadySmsExplicit(repair) { result ->
+                                        coroutineScope.launch {
+                                            val msg = when (result) {
+                                                is SmsSendResult.SentOrQueued -> "Ready SMS initiated and queued for ${repair.customerPhone}"
+                                                is SmsSendResult.PermissionDenied -> "SMS permission not granted. Please allow SMS permission in Android settings."
+                                                is SmsSendResult.Failed -> "Failed to send SMS: ${result.error}"
+                                                is SmsSendResult.DisabledInSettings -> "Automatic SMS is disabled in Settings."
+                                            }
+                                            snackbarHostState.showSnackbar(msg)
+                                        }
                                     }
+                                } else {
+                                    smsPermissionLauncher.launch(android.Manifest.permission.SEND_SMS)
                                 }
                             }
                         )

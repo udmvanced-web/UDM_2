@@ -1,7 +1,10 @@
 package com.example.data.repository
 
 import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
 import android.telephony.SmsManager
+import androidx.core.content.ContextCompat
 import com.example.data.AppDatabase
 import com.example.data.entity.AppSettingsEntity
 import com.example.data.entity.BrandEntity
@@ -14,12 +17,59 @@ import com.example.data.entity.RepairEntity
 import com.example.data.entity.RepairItemEntity
 import com.example.data.entity.RepairTypeEntity
 import com.example.data.entity.StatusHistoryEntity
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.text.SimpleDateFormat
+import java.util.Collections
 import java.util.Date
 import java.util.Locale
+
+sealed class SmsSendResult {
+    abstract val isSuccess: Boolean
+    abstract val message: String
+
+    data class SentOrQueued(
+        val recipient: String,
+        override val message: String = "Ready SMS initiated and queued for $recipient"
+    ) : SmsSendResult() {
+        override val isSuccess: Boolean = true
+    }
+
+    data class PermissionDenied(
+        override val message: String = "SMS permission not granted. Please allow SMS permission in Android settings."
+    ) : SmsSendResult() {
+        override val isSuccess: Boolean = false
+    }
+
+    data class Failed(
+        val error: String,
+        override val message: String = "Failed to send SMS: $error"
+    ) : SmsSendResult() {
+        override val isSuccess: Boolean = false
+    }
+
+    data class DisabledInSettings(
+        override val message: String = "Automatic Ready SMS is disabled in Settings."
+    ) : SmsSendResult() {
+        override val isSuccess: Boolean = false
+    }
+}
+
+data class SmsEvent(
+    val repairId: Long,
+    val jobNumber: String,
+    val customerPhone: String,
+    val result: SmsSendResult,
+    val isAuto: Boolean,
+    val message: String
+)
 
 class RepairRepository(private val db: AppDatabase, private val context: Context) {
 
@@ -34,6 +84,30 @@ class RepairRepository(private val db: AppDatabase, private val context: Context
     private val repairTypeDao = db.repairTypeDao()
     private val priceDao = db.priceDao()
     private val settingsDao = db.settingsDao()
+
+    private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private val processedReadyTransitions = Collections.synchronizedSet(mutableSetOf<String>())
+    private val prefs by lazy {
+        context.getSharedPreferences("udm_ready_sms_transitions", Context.MODE_PRIVATE)
+    }
+
+    private val _smsEvents = MutableSharedFlow<SmsEvent>(extraBufferCapacity = 64)
+    val smsEvents: SharedFlow<SmsEvent> = _smsEvents.asSharedFlow()
+
+    private fun markTransitionProcessed(marker: String): Boolean {
+        synchronized(processedReadyTransitions) {
+            if (processedReadyTransitions.contains(marker) || prefs.getBoolean(marker, false)) {
+                return false
+            }
+            processedReadyTransitions.add(marker)
+            try {
+                prefs.edit().putBoolean(marker, true).apply()
+            } catch (e: Exception) {
+                // Ignore SharedPreferences failure, in-memory set handles this session
+            }
+            return true
+        }
+    }
 
     val allRepairs: Flow<List<RepairEntity>> = repairDao.getAllRepairsFlow()
     val allPayments: Flow<List<PaymentEntity>> = paymentDao.getAllPaymentsFlow()
@@ -434,26 +508,19 @@ class RepairRepository(private val db: AppDatabase, private val context: Context
         val dateStr = dateFormat.format(Date(now))
         val timeStr = timeFormat.format(Date(now))
 
-        var readySmsSent = repair.readySmsSent
+        val isTransitionToReady = (newStatus == "READY")
         val deliveredTimestamp = if (newStatus == "DELIVERED") now else repair.deliveredTimestamp
 
-        // Automatic SMS when transitioning to READY
-        if (newStatus == "READY" && !repair.readySmsSent) {
-            val settings = getSettings()
-            if (settings.autoReadySms) {
-                val sent = sendSms(repair, settings)
-                if (sent) readySmsSent = true
-            }
-        }
-
+        // When transitioning to READY, mark readySmsSent = true. When leaving READY, reset to false so a future transition back to READY can send SMS again.
         val updated = repair.copy(
             status = newStatus,
             deliveredTimestamp = deliveredTimestamp,
-            readySmsSent = readySmsSent
+            readySmsSent = if (isTransitionToReady) true else false
         )
 
+        // 1. SAVE READY STATUS IMMEDIATELY to local database
         repairDao.updateRepair(updated)
-        statusHistoryDao.insertHistory(
+        val historyId = statusHistoryDao.insertHistory(
             StatusHistoryEntity(
                 repairId = repairId,
                 status = newStatus,
@@ -464,16 +531,85 @@ class RepairRepository(private val db: AppDatabase, private val context: Context
             )
         )
 
+        // 2. Immediately initiate Ready SMS asynchronously if transitioning to READY
+        if (isTransitionToReady) {
+            val transitionMarker = "${repairId}_${historyId}"
+            if (markTransitionProcessed(transitionMarker)) {
+                repositoryScope.launch(Dispatchers.IO) {
+                    performAutoReadySms(updated, transitionMarker)
+                }
+            }
+        }
+
         updated
     }
 
-    // Send SMS (Automatic or Manual "SEND SMS AGAIN")
-    suspend fun sendReadySmsExplicit(repair: RepairEntity): Boolean = withContext(Dispatchers.IO) {
+    private suspend fun performAutoReadySms(repair: RepairEntity, transitionMarker: String) {
         val settings = getSettings()
-        sendSms(repair, settings)
+        if (!settings.autoReadySms) {
+            return
+        }
+
+        val phone = repair.customerPhone.trim()
+        if (phone.isBlank()) {
+            _smsEvents.emit(
+                SmsEvent(
+                    repairId = repair.id,
+                    jobNumber = repair.jobNumber,
+                    customerPhone = phone,
+                    result = SmsSendResult.Failed("Customer phone number is blank"),
+                    isAuto = true,
+                    message = "Status marked READY. SMS not sent: Customer phone number is blank."
+                )
+            )
+            return
+        }
+
+        val result = sendSmsInternal(repair, settings)
+        val displayMessage = when (result) {
+            is SmsSendResult.SentOrQueued -> "Ready SMS initiated and queued for $phone"
+            is SmsSendResult.PermissionDenied -> "Status marked READY. SMS not sent: SMS permission not granted."
+            is SmsSendResult.Failed -> "Status marked READY. SMS failed: ${result.error}"
+            is SmsSendResult.DisabledInSettings -> "Automatic Ready SMS is disabled in Settings."
+        }
+
+        _smsEvents.emit(
+            SmsEvent(
+                repairId = repair.id,
+                jobNumber = repair.jobNumber,
+                customerPhone = phone,
+                result = result,
+                isAuto = true,
+                message = displayMessage
+            )
+        )
     }
 
-    private fun sendSms(repair: RepairEntity, settings: AppSettingsEntity): Boolean {
+    // Send SMS (Manual "SEND SMS AGAIN")
+    suspend fun sendReadySmsExplicit(repair: RepairEntity): SmsSendResult = withContext(Dispatchers.IO) {
+        val settings = getSettings()
+        sendSmsInternal(repair, settings)
+    }
+
+    private fun sendSmsInternal(repair: RepairEntity, settings: AppSettingsEntity): SmsSendResult {
+        val phone = repair.customerPhone.trim()
+        if (phone.isBlank()) {
+            return SmsSendResult.Failed("Customer phone number is blank")
+        }
+
+        val hasPermission = try {
+            ContextCompat.checkSelfPermission(
+                context,
+                android.Manifest.permission.SEND_SMS
+            ) == PackageManager.PERMISSION_GRANTED
+        } catch (e: Exception) {
+            false
+        }
+
+        if (!hasPermission) {
+            return SmsSendResult.PermissionDenied("SMS permission not granted. Please allow SMS permission in Android settings.")
+        }
+
         return try {
             val balanceStr = if (repair.balance <= 0) "0" else String.format(Locale.US, "%,.0f", repair.balance)
             val totalStr = String.format(Locale.US, "%,.0f", repair.totalPrice)
@@ -487,13 +623,24 @@ class RepairRepository(private val db: AppDatabase, private val context: Context
                 .replace("{shop_name}", settings.shopName)
                 .replace("{shop_phone}", settings.shopPhone)
 
-            val smsManager = SmsManager.getDefault()
+            val smsManager: SmsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                context.getSystemService(SmsManager::class.java)
+            } else {
+                @Suppress("DEPRECATION")
+                SmsManager.getDefault()
+            }
+
             val parts = smsManager.divideMessage(text)
-            smsManager.sendMultipartTextMessage(repair.customerPhone, null, parts, null, null)
-            true
+            smsManager.sendMultipartTextMessage(phone, null, parts, null, null)
+
+            SmsSendResult.SentOrQueued(
+                recipient = phone,
+                message = "Ready SMS initiated and queued for $phone"
+            )
+        } catch (se: SecurityException) {
+            SmsSendResult.PermissionDenied(se.localizedMessage ?: "SMS permission denied")
         } catch (e: Exception) {
-            e.printStackTrace()
-            false
+            SmsSendResult.Failed(e.localizedMessage ?: "Failed to initiate SMS sending")
         }
     }
 

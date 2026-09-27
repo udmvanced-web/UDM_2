@@ -16,9 +16,12 @@ import com.example.data.entity.RepairItemEntity
 import com.example.data.entity.RepairTypeEntity
 import com.example.data.entity.StatusHistoryEntity
 import com.example.data.repository.RepairRepository
+import com.example.data.repository.SmsEvent
+import com.example.data.repository.SmsSendResult
 import com.example.util.BackupManager
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -76,6 +79,8 @@ class RepairViewModel(application: Application) : AndroidViewModel(application) 
             current ?: default
         }
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), AppSettingsEntity())
+
+    val smsEvents: SharedFlow<SmsEvent> = repository.smsEvents
 
     // Filter states for Jobs Screen
     private val _searchQuery = MutableStateFlow("")
@@ -279,7 +284,7 @@ class RepairViewModel(application: Application) : AndroidViewModel(application) 
         }
     }
 
-    fun sendReadySmsExplicit(repair: RepairEntity, onResult: (Boolean) -> Unit) {
+    fun sendReadySmsExplicit(repair: RepairEntity, onResult: (SmsSendResult) -> Unit = {}) {
         viewModelScope.launch {
             val result = repository.sendReadySmsExplicit(repair)
             onResult(result)
